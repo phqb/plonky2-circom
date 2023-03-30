@@ -19,6 +19,12 @@ use plonky2::util::timing::TimingTree;
 use plonky2_util::log2_strict;
 use serde::Serialize;
 
+type ProofTuple<F, C, const D: usize> = (
+    ProofWithPublicInputs<F, C, D>,
+    VerifierOnlyCircuitData<C, D>,
+    CommonCircuitData<F, D>,
+);
+
 pub fn encode_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -93,6 +99,85 @@ where
     }
 
     println!("######################### recursive verify #########################");
+    data.verify(proof.clone())?;
+
+    Ok((proof, data.verifier_only, data.common))
+}
+
+fn recursive_proof2<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    InnerC: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    inner1: &ProofTuple<F, InnerC, D>,
+    inner2: &ProofTuple<F, InnerC, D>,
+    config: &CircuitConfig,
+    min_degree_bits: Option<usize>,
+) -> Result<ProofTuple<F, C, D>>
+where
+    InnerC::Hasher: AlgebraicHasher<F>,
+{
+    let mut builder = CircuitBuilder::<F, D>::new(config.clone());
+    let mut pw = PartialWitness::new();
+
+    {
+        let (inner_proof, inner_vd, inner_cd) = inner1;
+        let pt = builder.add_virtual_proof_with_pis::<InnerC>(inner_cd);
+        pw.set_proof_with_pis_target(&pt, inner_proof);
+        builder.register_public_inputs(&pt.public_inputs);
+
+        let inner_data = VerifierCircuitTarget {
+            constants_sigmas_cap: builder.add_virtual_cap(inner_cd.config.fri_config.cap_height),
+            circuit_digest: builder.add_virtual_hash(),
+        };
+        pw.set_cap_target(
+            &inner_data.constants_sigmas_cap,
+            &inner_vd.constants_sigmas_cap,
+        );
+        pw.set_hash_target(inner_data.circuit_digest, inner_vd.circuit_digest);
+
+        builder.verify_proof::<InnerC>(pt, &inner_data, inner_cd);
+    }
+
+    {
+        let (inner_proof, inner_vd, inner_cd) = inner2;
+        let pt = builder.add_virtual_proof_with_pis::<InnerC>(inner_cd);
+        pw.set_proof_with_pis_target(&pt, inner_proof);
+        builder.register_public_inputs(&pt.public_inputs);
+
+        let inner_data = VerifierCircuitTarget {
+            constants_sigmas_cap: builder.add_virtual_cap(inner_cd.config.fri_config.cap_height),
+            circuit_digest: builder.add_virtual_hash(),
+        };
+        pw.set_hash_target(inner_data.circuit_digest, inner_vd.circuit_digest);
+        pw.set_cap_target(
+            &inner_data.constants_sigmas_cap,
+            &inner_vd.constants_sigmas_cap,
+        );
+
+        builder.verify_proof::<InnerC>(pt, &inner_data, inner_cd);
+    }
+
+    builder.print_gate_counts(0);
+
+    if let Some(min_degree_bits) = min_degree_bits {
+        // We don't want to pad all the way up to 2^min_degree_bits, as the builder will
+        // add a few special gates afterward. So just pad to 2^(min_degree_bits
+        // - 1) + 1. Then the builder will pad to the next power of two,
+        // 2^min_degree_bits.
+        let min_gates = (1 << (min_degree_bits - 1)) + 1;
+        for _ in builder.num_gates()..min_gates {
+            builder.add_gate(NoopGate, vec![]);
+        }
+    }
+
+    let data = builder.build::<C>();
+
+    let mut timing = TimingTree::new("prove", Level::Debug);
+    let proof = prove(&data.prover_only, &data.common, pw, &mut timing)?;
+    timing.print();
+
     data.verify(proof.clone())?;
 
     Ok((proof, data.verifier_only, data.common))
@@ -993,14 +1078,23 @@ mod tests {
 
     use crate::config::PoseidonBN128GoldilocksConfig;
     use anyhow::Result;
+    use log::{info, Level};
     use plonky2::field::extension::Extendable;
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::types::{Field, Sample};
     use plonky2::fri::reduction_strategies::FriReductionStrategy;
     use plonky2::fri::FriConfig;
-    use plonky2::hash::hash_types::RichField;
+    use plonky2::hash::hash_types::{HashOut, RichField};
+    use plonky2::hash::merkle_proofs::{MerkleProof, MerkleProofTarget};
+    use plonky2::hash::merkle_tree::MerkleTree;
+    use plonky2::hash::poseidon::PoseidonHash;
+    use plonky2::iop::target::Target;
     use plonky2::iop::witness::Witness;
     use plonky2::plonk::circuit_data::{CommonCircuitData, VerifierOnlyCircuitData};
     use plonky2::plonk::config::{Hasher, PoseidonGoldilocksConfig};
     use plonky2::plonk::proof::ProofWithPublicInputs;
+    use plonky2::plonk::prover::prove;
+    use plonky2::util::timing::TimingTree;
     use plonky2::{
         gates::noop::NoopGate,
         iop::witness::PartialWitness,
@@ -1011,7 +1105,10 @@ mod tests {
 
     use crate::verifier::{
         generate_circom_verifier, generate_proof_base64, generate_verifier_config, recursive_proof,
+        recursive_proof2,
     };
+
+    use super::ProofTuple;
 
     /// Creates a dummy proof which should have roughly `num_dummy_gates` gates.
     fn dummy_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
@@ -1148,6 +1245,274 @@ mod tests {
         type CBn128 = PoseidonBN128GoldilocksConfig;
         let (proof, vd, cd) =
             recursive_proof::<F, CBn128, C, D>(proof, vd, cd, &standard_config, None, true, true)?;
+
+        let conf = generate_verifier_config(&proof)?;
+        let (circom_constants, circom_gates) = generate_circom_verifier(&conf, &cd, &vd)?;
+
+        let mut circom_file = File::create("./circom/circuits/constants.circom")?;
+        circom_file.write_all(circom_constants.as_bytes())?;
+        circom_file = File::create("./circom/circuits/gates.circom")?;
+        circom_file.write_all(circom_gates.as_bytes())?;
+
+        let proof_json = generate_proof_base64(&proof, &conf)?;
+
+        if !Path::new("./circom/test/data").is_dir() {
+            std::fs::create_dir("./circom/test/data")?;
+        }
+
+        let mut proof_file = File::create("./circom/test/data/proof.json")?;
+        proof_file.write_all(proof_json.as_bytes())?;
+
+        let mut conf_file = File::create("./circom/test/data/conf.json")?;
+        conf_file.write_all(serde_json::to_string(&conf)?.as_ref())?;
+
+        Ok(())
+    }
+
+    fn tree_height() -> usize {
+        20
+    }
+
+    fn semaphore_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+        config: &CircuitConfig,
+        private_key: [F; 4],
+        rln: F,
+        topic: [F; 4],
+        public_key_index: usize,
+        merkle_proof: MerkleProof<F, PoseidonHash>,
+        merkle_root_value: HashOut<F>,
+    ) -> Result<ProofTuple<F, C, D>> {
+        let mut builder = CircuitBuilder::<F, D>::new(config.clone());
+
+        let merkle_root_target = builder.add_virtual_hash();
+        builder.register_public_inputs(&merkle_root_target.elements);
+        let nullifier_target = builder.add_virtual_hash();
+        builder.register_public_inputs(&nullifier_target.elements);
+        let topic_target: [Target; 4] = builder.add_virtual_targets(4).try_into().unwrap();
+        builder.register_public_inputs(&topic_target);
+
+        let new_leaf_target = builder.add_virtual_hash();
+        builder.register_public_inputs(&new_leaf_target.elements);
+
+        // Merkle proof
+        let merkle_proof_target = MerkleProofTarget {
+            siblings: builder.add_virtual_hashes(tree_height()),
+        };
+
+        // Verify public key Merkle proof.
+        let private_key_target: [Target; 4] = builder.add_virtual_targets(4).try_into().unwrap();
+        let rln_target = builder.add_virtual_target();
+        let new_rln_target = builder.add_virtual_target();
+        let public_key_index_target = builder.add_virtual_target();
+        let public_key_index_bits_target = builder.split_le(public_key_index_target, tree_height());
+        let zero_target = builder.zero();
+        let neg_one_target = builder.neg_one();
+
+        builder.verify_merkle_proof::<PoseidonHash>(
+            [
+                private_key_target,
+                [zero_target, zero_target, zero_target, rln_target],
+            ]
+            .concat(),
+            &public_key_index_bits_target,
+            merkle_root_target,
+            &merkle_proof_target,
+        );
+
+        // Check nullifier.
+        let should_be_nullifier_target = builder
+            .hash_n_to_hash_no_pad::<PoseidonHash>([private_key_target, topic_target].concat());
+        for i in 0..4 {
+            builder.connect(
+                nullifier_target.elements[i],
+                should_be_nullifier_target.elements[i],
+            );
+        }
+
+        let should_be_new_rln_target = builder.add(rln_target, neg_one_target);
+        builder.connect(should_be_new_rln_target, new_rln_target);
+        builder.range_check(new_rln_target, 32);
+
+        // Check new leaf.
+        let should_be_new_leaf_target = builder.hash_n_to_hash_no_pad::<PoseidonHash>(
+            [
+                private_key_target,
+                [zero_target, zero_target, zero_target, new_rln_target],
+            ]
+            .concat(),
+        );
+        for i in 0..4 {
+            builder.connect(
+                new_leaf_target.elements[i],
+                should_be_new_leaf_target.elements[i],
+            );
+        }
+
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+
+        pw.set_hash_target(merkle_root_target, merkle_root_value);
+        pw.set_target_arr(private_key_target, private_key);
+        pw.set_target(rln_target, rln);
+        pw.set_target(new_rln_target, rln.sub_one());
+        pw.set_target_arr(topic_target, topic);
+        pw.set_target(
+            public_key_index_target,
+            F::from_canonical_usize(public_key_index),
+        );
+
+        for (ht, h) in merkle_proof_target
+            .siblings
+            .into_iter()
+            .zip(merkle_proof.siblings.clone())
+        {
+            pw.set_hash_target(ht, h);
+        }
+
+        let mut timing = TimingTree::new("prove", Level::Debug);
+        let proof = prove(&data.prover_only, &data.common, pw, &mut timing)?;
+        timing.print();
+        data.verify(proof.clone())?;
+
+        Ok((proof, data.verifier_only, data.common))
+    }
+
+    #[test]
+    fn test_recursive_semaphore_proof() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = GoldilocksField;
+
+        let config = CircuitConfig::standard_recursion_config();
+        let zk_config = CircuitConfig::standard_recursion_config();
+
+        // CREATE TREE WITH 2^n leaves
+        let n = 1 << tree_height();
+        let private_keys: Vec<[F; 4]> = (0..n).map(|_| F::rand_array()).collect();
+        let rlns: Vec<F> = (0..n).map(|_| F::ONE).collect();
+        let public_keys: Vec<Vec<F>> = private_keys
+            .iter()
+            .map(|&sk| {
+                PoseidonHash::hash_no_pad(&[sk, [F::ZERO, F::ZERO, F::ZERO, F::ONE]].concat())
+                    .elements
+                    .to_vec()
+            })
+            .collect();
+
+        let merkle_tree: MerkleTree<GoldilocksField, PoseidonHash> =
+            MerkleTree::new(public_keys, 0);
+        let merkle_root_value = merkle_tree.cap.0[0];
+
+        // Start with a dummy proof of specified size
+        let merkle_proof1 = merkle_tree.prove(1);
+        let topic1: [GoldilocksField; 4] = F::rand_array();
+        let nullifier1 = PoseidonHash::hash_no_pad(&[private_keys[1], topic1].concat()).elements;
+        let inner1 = dummy_proof::<F, C, D>(&config, 4000, 4)?;
+        // let inner1 = semaphore_proof(
+        //     &zk_config,
+        //     private_keys[1],
+        //     rlns[1],
+        //     topic1,
+        //     1,
+        //     merkle_proof1,
+        //     merkle_root_value,
+        // )?; //dummy_proof::<F, C, D>(config, log2_inner_size)?;
+        let (_, _, cd1) = &inner1;
+        info!(
+            "Initial proof 1 degree {} = 2^{}",
+            cd1.degree(),
+            cd1.degree_bits()
+        );
+
+        let merkle_proof2 = merkle_tree.prove(2);
+        let topic2: [GoldilocksField; 4] = F::rand_array();
+        let nullifier2 = PoseidonHash::hash_no_pad(&[private_keys[2], topic2].concat()).elements;
+        let inner2 = dummy_proof::<F, C, D>(&config, 4000, 4)?;
+        // let inner2 = semaphore_proof(
+        //     &zk_config,
+        //     private_keys[2],
+        //     rlns[2],
+        //     topic1,
+        //     2,
+        //     merkle_proof2,
+        //     merkle_root_value,
+        // )?; //dummy_proof::<F, C, D>(config, log2_inner_size)?;
+        //let inner2 = dummy_proof::<F, C, D>(config, log2_inner_size)?;
+        let (_, _, cd2) = &inner2;
+        info!(
+            "Initial proof 2 degree {} = 2^{}",
+            cd2.degree(),
+            cd2.degree_bits()
+        );
+
+        // Recursively verify the proof
+        let middle1 = recursive_proof2::<F, C, C, D>(&inner1, &inner2, &config, None)?;
+        let (_, _, cdm1) = &middle1;
+        info!(
+            "Single recursion proof 1 degree {} = 2^{}",
+            cdm1.degree(),
+            cdm1.degree_bits()
+        );
+
+        let merkle_proof3 = merkle_tree.prove(3);
+        let topic3: [GoldilocksField; 4] = F::rand_array();
+        //let inner3 = dummy_proof::<F, C, D>(config, log2_inner_size)?;
+        let nullifier3 = PoseidonHash::hash_no_pad(&[private_keys[3], topic3].concat()).elements;
+        let inner3 = dummy_proof::<F, C, D>(&config, 4000, 4)?;
+        // let inner3 = semaphore_proof(
+        //     &zk_config,
+        //     private_keys[3],
+        //     rlns[3],
+        //     topic1,
+        //     3,
+        //     merkle_proof3,
+        //     merkle_root_value,
+        // )?; //dummy_proof::<F, C, D>(config, log2_inner_size)?;
+        let (_, _, cd3) = &inner3;
+        info!(
+            "Initial proof 3 degree {} = 2^{}",
+            cd3.degree(),
+            cd3.degree_bits()
+        );
+
+        let merkle_proof4 = merkle_tree.prove(4);
+        let topic4: [GoldilocksField; 4] = F::rand_array();
+        let nullifier4 = PoseidonHash::hash_no_pad(&[private_keys[4], topic1].concat()).elements;
+        let inner4 = dummy_proof::<F, C, D>(&config, 4000, 4)?;
+        // let inner4 = semaphore_proof(
+        //     &zk_config,
+        //     private_keys[4],
+        //     rlns[4],
+        //     topic4,
+        //     4,
+        //     merkle_proof4,
+        //     merkle_root_value,
+        // )?; //dummy_proof::<F, C, D>(config, log2_inner_size)?;
+        //let inner4 = dummy_proof::<F, C, D>(config, log2_inner_size)?;
+        let (_, _, cd4) = &inner4;
+        info!(
+            "Initial proof 4 degree {} = 2^{}",
+            cd4.degree(),
+            cd4.degree_bits()
+        );
+
+        // Recursively verify the proof
+        let middle2 = recursive_proof2::<F, C, C, D>(&inner3, &inner4, &config, None)?;
+        let (_, _, cdm2) = &middle2;
+        info!(
+            "Single recursion proof 2 degree {} = 2^{}",
+            cdm2.degree(),
+            cdm2.degree_bits()
+        );
+
+        // Add a second layer of recursion to shrink the proof size further
+        let outer = recursive_proof2::<F, C, C, D>(&middle1, &middle2, &config, None)?;
+        let (proof, vd, cd) = &outer;
+        info!(
+            "Double recursion proof degree {} = 2^{}",
+            cd.degree(),
+            cd.degree_bits()
+        );
 
         let conf = generate_verifier_config(&proof)?;
         let (circom_constants, circom_gates) = generate_circom_verifier(&conf, &cd, &vd)?;
